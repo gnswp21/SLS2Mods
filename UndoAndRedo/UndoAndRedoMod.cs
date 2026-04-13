@@ -409,6 +409,8 @@ public static class UndoAndRedoMod
             NotifyCombatStateChangedMethod?.Invoke(stateTracker, new object[] { "UndoAndRedo" });
         }
 
+        // (TurnStarted event is now fired in CombatSnapshot.Restore as part of play phase init)
+
         // Deferred refresh of card descriptions so per-turn counters update
         // (NCards added during RefreshHandVisuals may not be IsNodeReady() yet)
         RefreshCardDescriptionsDeferred();
@@ -449,6 +451,8 @@ public static class UndoAndRedoMod
         }
         catch (Exception ex) { Log.Write($"ResetEndTurnState: clear enemy ready set ERROR: {ex}"); }
 
+        // (ActionQueueSynchronizer/queue pause states are now restored in CombatSnapshot.Restore)
+
         // Set PlayerActionsDisabled = false (uses property setter to fire event)
         try
         {
@@ -484,14 +488,30 @@ public static class UndoAndRedoMod
 
         try
         {
-            // Clear _currentCardPlay so InCardPlay returns false
+            // Clear _currentCardPlay so InCardPlay returns false.
+            // Also QueueFree the NCardPlay node (and its child NCard) to remove
+            // the "stuck in air" visual that blocks mouse input.
             if (HandCurrentCardPlayField != null)
             {
                 var currentPlay = HandCurrentCardPlayField.GetValue(hand);
                 if (currentPlay != null)
                 {
-                    Log.Write("ResetEndTurnState: clearing _currentCardPlay");
+                    Log.Write("ResetEndTurnState: clearing _currentCardPlay and removing visual");
                     HandCurrentCardPlayField.SetValue(hand, null);
+
+                    // QueueFree the NCardPlay node — it contains the floating NCard
+                    if (currentPlay is Node playNode && GodotObject.IsInstanceValid(playNode))
+                    {
+                        // Kill any active tween first
+                        var tweenField = AccessTools.Field(playNode.GetType(), "_tween");
+                        if (tweenField != null)
+                        {
+                            var tween = tweenField.GetValue(playNode) as Tween;
+                            if (tween != null && tween.IsValid()) tween.Kill();
+                        }
+                        playNode.QueueFree();
+                        Log.Write("ResetEndTurnState: QueueFree'd NCardPlay node");
+                    }
                 }
             }
 
@@ -1026,7 +1046,7 @@ public static class PatchNGameInput
             return;
 
         if (key.Keycode == Key.Left || key.Keycode == Key.Right)
-            Log.Write($"InputPatch: key={key.Keycode} received, checking CanUndoRedo...");
+            Log.Write($"InputPatch: key={key.Keycode}");
 
         if (!UndoAndRedoMod.CanUndoRedo())
             return;
@@ -1101,3 +1121,142 @@ public static class PatchCombatReset
         UndoAndRedoMod.ClearStacks();
     }
 }
+
+// Compensate for broken turn lifecycle + schedule delayed PlayPhase init
+[HarmonyPatch(typeof(CombatManager), "StartTurn")]
+public static class PatchStartTurn
+{
+    [HarmonyPrefix]
+    public static void Prefix(CombatManager __instance)
+    {
+        try
+        {
+            var cs = AccessTools.Field(typeof(CombatManager), "_state")?.GetValue(__instance) as CombatState;
+            Log.Write($">>> StartTurn called: side={cs?.CurrentSide} round={cs?.RoundNumber} IsInProgress={__instance.IsInProgress}");
+
+            // For player turns: schedule a delayed check that fires PlayPhase init
+            // if StartTurn's async flow hangs (which happens after undo breaks a hook/power).
+            if (cs?.CurrentSide == CombatSide.Player)
+            {
+                _ = DelayedPlayPhaseCheck(cs);
+            }
+        }
+        catch { Log.Write(">>> StartTurn called"); }
+    }
+
+    private static async Task DelayedPlayPhaseCheck(CombatState cs)
+    {
+        try
+        {
+            // Wait ~60 frames (~1 second at 60fps) for normal StartTurn to complete
+            for (int i = 0; i < 60; i++)
+                await NGame.Instance.ToSignal(NGame.Instance.GetTree(), SceneTree.SignalName.ProcessFrame);
+
+            var syncr = RunManager.Instance?.ActionQueueSynchronizer;
+            if (syncr == null || cs.CurrentSide != CombatSide.Player) return;
+            if (syncr.CombatState != MegaCrit.Sts2.Core.Entities.Multiplayer.ActionSynchronizerCombatState.NotPlayPhase) return;
+
+            // StartTurn's async flow hung — the hooks and PlayPhase init never ran.
+            // Run the skipped steps: AfterSideTurnStart, OrbQueue.AfterTurnStart,
+            // BeforePlayPhaseStart, CheckWinCondition, then PlayPhase init.
+            Log.Write(">>> DelayedPlayPhaseCheck: StartTurn hung, running skipped steps");
+
+            var cm = CombatManager.Instance;
+            if (cm == null || !cm.IsInProgress) return;
+
+            // 1. Hook.AfterSideTurnStart (power/relic turn start effects)
+            try
+            {
+                Log.Write(">>> DelayedPlayPhaseCheck: calling Hook.AfterSideTurnStart(Player)");
+                await MegaCrit.Sts2.Core.Hooks.Hook.AfterSideTurnStart(cs, CombatSide.Player);
+                Log.Write(">>> DelayedPlayPhaseCheck: Hook.AfterSideTurnStart done");
+            }
+            catch (Exception ex) { Log.Write($">>> DelayedPlayPhaseCheck: AfterSideTurnStart ERROR: {ex.Message}"); }
+
+            // 2. OrbQueue.AfterTurnStart
+            try
+            {
+                var localNetId = MegaCrit.Sts2.Core.Context.LocalContext.NetId;
+                if (localNetId.HasValue)
+                {
+                    foreach (var player in cs.Players)
+                    {
+                        if (player?.PlayerCombatState?.OrbQueue != null)
+                        {
+                            Log.Write(">>> DelayedPlayPhaseCheck: calling OrbQueue.AfterTurnStart");
+                            var ctx = new MegaCrit.Sts2.Core.GameActions.Multiplayer.HookPlayerChoiceContext(
+                                player, localNetId.Value,
+                                MegaCrit.Sts2.Core.Entities.Multiplayer.GameActionType.CombatPlayPhaseOnly);
+                            await player.PlayerCombatState.OrbQueue.AfterTurnStart(ctx);
+                            Log.Write(">>> DelayedPlayPhaseCheck: OrbQueue.AfterTurnStart done");
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { Log.Write($">>> DelayedPlayPhaseCheck: OrbQueue ERROR: {ex.Message}"); }
+
+            // 3. Hook.BeforePlayPhaseStart
+            try
+            {
+                foreach (var player in cs.Players)
+                {
+                    if (!player.Creature.IsDead)
+                    {
+                        Log.Write(">>> DelayedPlayPhaseCheck: calling Hook.BeforePlayPhaseStart");
+                        await MegaCrit.Sts2.Core.Hooks.Hook.BeforePlayPhaseStart(cs, player);
+                        Log.Write(">>> DelayedPlayPhaseCheck: Hook.BeforePlayPhaseStart done");
+                    }
+                }
+            }
+            catch (Exception ex) { Log.Write($">>> DelayedPlayPhaseCheck: BeforePlayPhaseStart ERROR: {ex.Message}"); }
+
+            // 4. CheckWinCondition
+            try
+            {
+                Log.Write(">>> DelayedPlayPhaseCheck: calling CheckWinCondition");
+                await cm.CheckWinCondition();
+                Log.Write($">>> DelayedPlayPhaseCheck: CheckWinCondition done, IsInProgress={cm.IsInProgress}");
+            }
+            catch (Exception ex) { Log.Write($">>> DelayedPlayPhaseCheck: CheckWinCondition ERROR: {ex.Message}"); }
+
+            // 5. PlayPhase init (same as StartTurn lines 393638-393642)
+            if (cm.IsInProgress)
+            {
+                Log.Write(">>> DelayedPlayPhaseCheck: forcing PlayPhase init");
+                var deferredField = AccessTools.Field(syncr.GetType(), "_requestedActionsWaitingForPlayerTurn");
+                if (deferredField?.GetValue(syncr) is System.Collections.IList deferred) deferred.Clear();
+                var bf = AccessTools.Field(syncr.GetType(), "<CombatState>k__BackingField");
+                bf?.SetValue(syncr, MegaCrit.Sts2.Core.Entities.Multiplayer.ActionSynchronizerCombatState.PlayPhase);
+                RunManager.Instance?.ActionQueueSet?.UnpauseAllPlayerQueues();
+                RunManager.Instance?.ActionExecutor?.Unpause();
+                AccessTools.Property(typeof(CombatManager), "IsPlayPhase")?.SetValue(cm, true);
+                AccessTools.Property(typeof(CombatManager), "IsEnemyTurnStarted")?.SetValue(cm, false);
+                var del = AccessTools.Field(typeof(CombatManager), "TurnStarted")?.GetValue(cm) as Delegate;
+                del?.DynamicInvoke(cs);
+                Log.Write(">>> DelayedPlayPhaseCheck: PlayPhase init complete");
+            }
+        }
+        catch (Exception ex) { Log.Write($">>> DelayedPlayPhaseCheck ERROR: {ex.Message}"); }
+    }
+}
+
+
+// Log NPlayerHand mode changes to track card selection/targeting flow
+[HarmonyPatch(typeof(NPlayerHand), "set_CurrentMode")]
+public static class PatchHandModeChanged
+{
+    [HarmonyPostfix]
+    public static void Postfix(NPlayerHand __instance)
+    {
+        try
+        {
+            var mode = AccessTools.Field(typeof(NPlayerHand), "_currentMode")?.GetValue(__instance);
+            var cp = AccessTools.Field(typeof(NPlayerHand), "_currentCardPlay")?.GetValue(__instance);
+            var drag = AccessTools.Field(typeof(NPlayerHand), "_draggedHolderIndex")?.GetValue(__instance);
+            var disabled = AccessTools.Field(typeof(NPlayerHand), "_isDisabled")?.GetValue(__instance);
+            Log.Write($"HandMode changed: mode={mode} currentCardPlay={cp != null} dragIdx={drag} handDisabled={disabled}");
+        }
+        catch { }
+    }
+}
+

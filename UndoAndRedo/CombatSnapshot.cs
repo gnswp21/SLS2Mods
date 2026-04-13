@@ -100,6 +100,12 @@ public class CombatSnapshot
     private int _roundNumber;
     private CombatSide _currentSide;
 
+    // Control flow state — these are managed by event chains that undo bypasses
+    private MegaCrit.Sts2.Core.Entities.Multiplayer.ActionSynchronizerCombatState _syncCombatState;
+    private bool _cmIsPaused;
+    private bool _executorIsPaused;
+    private readonly List<bool> _actionQueuePauseStates = new(); // per-queue isPaused
+
     // RNG
     private readonly Dictionary<RunRngType, (uint seed, int counter)> _runRngStates = new();
     private readonly Dictionary<uint, (uint seed, int counter)> _monsterRngStates = new();
@@ -387,11 +393,45 @@ public class CombatSnapshot
         try
         {
 
+        // Capture control flow state
+        var syncCombatState = MegaCrit.Sts2.Core.Entities.Multiplayer.ActionSynchronizerCombatState.PlayPhase;
+        var cmPaused = false;
+        var execPaused = false;
+        var queuePauseStates = new List<bool>();
+        try
+        {
+            var syncr = RunManager.Instance?.ActionQueueSynchronizer;
+            if (syncr != null) syncCombatState = syncr.CombatState;
+            cmPaused = CombatManager.Instance?.IsPaused ?? false;
+            var executor = RunManager.Instance?.ActionExecutor;
+            if (executor != null) execPaused = executor.IsPaused;
+            // Capture per-queue pause state
+            var aqSet = RunManager.Instance?.ActionQueueSet;
+            if (aqSet != null)
+            {
+                var queuesField = AccessTools.Field(aqSet.GetType(), "_actionQueues");
+                if (queuesField?.GetValue(aqSet) is System.Collections.IList queues)
+                {
+                    foreach (var q in queues)
+                    {
+                        var pausedField = AccessTools.Field(q.GetType(), "isPaused");
+                        queuePauseStates.Add(pausedField != null && (bool)pausedField.GetValue(q)!);
+                    }
+                }
+            }
+        }
+        catch { }
+
         var snapshot = new CombatSnapshot
         {
             _roundNumber = cs.RoundNumber,
-            _currentSide = cs.CurrentSide
+            _currentSide = cs.CurrentSide,
+            _syncCombatState = syncCombatState,
+            _cmIsPaused = cmPaused,
+            _executorIsPaused = execPaused
         };
+
+        snapshot._actionQueuePauseStates.AddRange(queuePauseStates);
 
         // Capture creature roster (to detect summons for removal on undo)
         foreach (var creature in cs.Creatures)
@@ -745,6 +785,102 @@ public class CombatSnapshot
 
         cs.RoundNumber = _roundNumber;
         cs.CurrentSide = _currentSide;
+
+        // Restore async machinery — clean up stale state, then re-initialize play phase.
+        //
+        // Instead of trying to save/restore every piece of async state individually,
+        // we: (1) clean up anything stale, then (2) run the same 5-line play phase
+        // initialization that the game does at the start of every player turn
+        // (CombatManager.StartTurn lines 393638-393642). This ensures the async
+        // machinery is in a known-good state regardless of what undo disrupted.
+        try
+        {
+            var syncr = RunManager.Instance?.ActionQueueSynchronizer;
+            var executor = RunManager.Instance?.ActionExecutor;
+
+            // 1. Clear stale deferred actions (would be enqueued by SetCombatState)
+            if (syncr != null)
+            {
+                var deferredField = AccessTools.Field(syncr.GetType(), "_requestedActionsWaitingForPlayerTurn");
+                if (deferredField?.GetValue(syncr) is System.Collections.IList deferred && deferred.Count > 0)
+                {
+                    Log.Write($"Restore: clearing {deferred.Count} stale deferred actions");
+                    deferred.Clear();
+                }
+            }
+
+            // 2. Complete any pending ActionExecutor TCS so IsRunning=false
+            if (executor != null)
+            {
+                var tcsField = AccessTools.Field(executor.GetType(), "_queueTaskCompletionSource");
+                if (tcsField != null)
+                {
+                    var tcs = tcsField.GetValue(executor);
+                    if (tcs != null)
+                    {
+                        var task = tcs.GetType().GetProperty("Task")?.GetValue(tcs) as Task;
+                        if (task != null && !task.IsCompleted)
+                        {
+                            Log.Write("Restore: completing ActionExecutor TCS");
+                            tcs.GetType().GetMethod("TrySetResult")?.Invoke(tcs, new object[] { true });
+                        }
+                    }
+                }
+            }
+
+            // 3. Clear NPlayerHand._selectionCompletionSource (Burning Pact / SimpleSelect)
+            var hand = NPlayerHand.Instance;
+            if (hand != null)
+            {
+                var selTcsField = AccessTools.Field(typeof(NPlayerHand), "_selectionCompletionSource");
+                if (selTcsField != null)
+                {
+                    var selTcs = selTcsField.GetValue(hand);
+                    if (selTcs != null)
+                    {
+                        var selTask = selTcs.GetType().GetProperty("Task")?.GetValue(selTcs) as Task;
+                        if (selTask != null && !selTask.IsCompleted)
+                        {
+                            Log.Write("Restore: completing _selectionCompletionSource");
+                            selTcs.GetType().GetMethod("SetResult")
+                                ?.Invoke(selTcs, new object[] { System.Array.Empty<CardModel>() });
+                        }
+                        selTcsField.SetValue(hand, null);
+                    }
+                }
+                var backstopField = AccessTools.Field(typeof(NPlayerHand), "_selectModeBackstop");
+                if (backstopField?.GetValue(hand) is Control backstop) backstop.Visible = false;
+                var headerField = AccessTools.Field(typeof(NPlayerHand), "_selectionHeader");
+                if (headerField?.GetValue(hand) is Control header) header.Visible = false;
+                var selectedField = AccessTools.Field(typeof(NPlayerHand), "_selectedCards");
+                if (selectedField?.GetValue(hand) is System.Collections.IList sel && sel.Count > 0) sel.Clear();
+            }
+
+            // 4. Re-initialize play phase — the same sequence the game runs at the
+            //    start of every player turn (CombatManager.StartTurn lines 393638-393642).
+            //    This ensures SetCombatState, queue unpausing, IsPlayPhase, and
+            //    TurnStarted event all happen correctly, regardless of what undo broke.
+            if (_currentSide == CombatSide.Player)
+            {
+                Log.Write("Restore: re-initializing player play phase");
+                executor?.Unpause();
+                syncr?.SetCombatState(
+                    MegaCrit.Sts2.Core.Entities.Multiplayer.ActionSynchronizerCombatState.PlayPhase);
+                var cmInst = CombatManager.Instance;
+                if (cmInst != null)
+                {
+                    var isPlayPhaseProp = AccessTools.Property(typeof(CombatManager), "IsPlayPhase");
+                    isPlayPhaseProp?.SetValue(cmInst, true);
+                    var isEnemyStartedProp = AccessTools.Property(typeof(CombatManager), "IsEnemyTurnStarted");
+                    isEnemyStartedProp?.SetValue(cmInst, false);
+                    // Fire TurnStarted — updates End Turn button text + visibility
+                    var turnStartedField = AccessTools.Field(typeof(CombatManager), "TurnStarted");
+                    var turnStartedDelegate = turnStartedField?.GetValue(cmInst) as Delegate;
+                    turnStartedDelegate?.DynamicInvoke(cs);
+                }
+            }
+        }
+        catch (Exception ex) { Log.Write($"Restore: async state ERROR: {ex.Message}"); }
 
         // Restore creature states
         try
