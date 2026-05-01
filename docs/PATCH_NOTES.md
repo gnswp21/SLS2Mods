@@ -9,6 +9,11 @@ This patch addresses build errors and compatibility issues with the Slay the Spi
   - **Reason**: This hook was removed or renamed in the latest game assemblies, causing a compilation failure.
   - **Impact**: This was part of a "safety net" deferred check. Standard undo/redo functionality remains intact.
 
+### Fixed Bugs (2026-05-01 Update)
+- **Double-triggering on Turn Start**: Fixed a bug where `DelayedPlayPhaseCheck` would incorrectly trigger even if the turn had already started normally.
+  - **Fix**: Added robust guards to check `IsPlayPhase` and `ActionQueueSynchronizer` state before forcing any turn-start hooks.
+  - **Technical Change**: Exposed `IsPlayPhaseProp` as `internal` to allow cross-class access for validation.
+
 ### Installation & Build Notes
 - **.NET SDK**: Requires .NET 9.0 SDK.
 - **Dependency**: Reference `sts2.dll`, `0Harmony.dll`, and `GodotSharp.dll` from the `<game>/data_sts2_windows_x86_64/` directory.

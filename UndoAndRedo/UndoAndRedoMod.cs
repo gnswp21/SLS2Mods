@@ -175,7 +175,7 @@ public static class UndoAndRedoMod
         AccessTools.Field(typeof(CombatManager), "_playersReadyToEndTurn");
     private static readonly System.Reflection.PropertyInfo? PlayerActionsDisabledProp =
         AccessTools.Property(typeof(CombatManager), "PlayerActionsDisabled");
-    private static readonly System.Reflection.PropertyInfo? IsPlayPhaseProp =
+    internal static readonly System.Reflection.PropertyInfo? IsPlayPhaseProp =
         AccessTools.Property(typeof(CombatManager), "IsPlayPhase");
     private static readonly System.Reflection.PropertyInfo? EndingPhaseOneProp =
         AccessTools.Property(typeof(CombatManager), "EndingPlayerTurnPhaseOne");
@@ -1152,17 +1152,19 @@ public static class PatchStartTurn
             for (int i = 0; i < 60; i++)
                 await NGame.Instance.ToSignal(NGame.Instance.GetTree(), SceneTree.SignalName.ProcessFrame);
 
+            var cm = CombatManager.Instance;
             var syncr = RunManager.Instance?.ActionQueueSynchronizer;
-            if (syncr == null || cs.CurrentSide != CombatSide.Player) return;
-            if (syncr.CombatState != MegaCrit.Sts2.Core.Entities.Multiplayer.ActionSynchronizerCombatState.NotPlayPhase) return;
+            
+            // 강화된 가드 조건: 
+            // 1. 전투가 종료되었거나
+            // 2. 이미 플레이어 페이즈(IsPlayPhase)로 진입했거나
+            // 3. 현재 턴이 플레이어가 아니거나
+            // 4. 액션 동기화 상태가 이미 PlayPhase라면 중단
+            bool isPlayPhase = (bool)(UndoAndRedoMod.IsPlayPhaseProp?.GetValue(cm) ?? false);
+            if (cm == null || !cm.IsInProgress || isPlayPhase || cs.CurrentSide != CombatSide.Player) return;
+            if (syncr == null || syncr.CombatState == MegaCrit.Sts2.Core.Entities.Multiplayer.ActionSynchronizerCombatState.PlayPhase) return;
 
             // StartTurn's async flow hung — the hooks and PlayPhase init never ran.
-            // Run the skipped steps: AfterSideTurnStart, OrbQueue.AfterTurnStart,
-            // BeforePlayPhaseStart, CheckWinCondition, then PlayPhase init.
-            Log.Write(">>> DelayedPlayPhaseCheck: StartTurn hung, running skipped steps");
-
-            var cm = CombatManager.Instance;
-            if (cm == null || !cm.IsInProgress) return;
 
             // 1. Hook.AfterSideTurnStart (power/relic turn start effects)
             try
