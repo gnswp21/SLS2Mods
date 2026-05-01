@@ -25,7 +25,20 @@ public static class UndoAndRedoMod
     private const int MaxUndoStackSize = 50;
     private static readonly List<CombatSnapshot> UndoStack = new();
     private static readonly List<CombatSnapshot> RedoStack = new();
+    private static int _lastHandledStartTurnRound = -1;
+    private static CombatSide _lastHandledStartTurnSide = CombatSide.None;
     internal static bool IsRestoring;
+
+    public static void SetLastStartTurn(int round, CombatSide side)
+    {
+        _lastHandledStartTurnRound = round;
+        _lastHandledStartTurnSide = side;
+    }
+
+    public static bool IsStartTurnHandled(int round, CombatSide side)
+    {
+        return _lastHandledStartTurnRound == round && _lastHandledStartTurnSide == side;
+    }
 
     public static void Initialize()
     {
@@ -1138,6 +1151,7 @@ public static class PatchStartTurn
             // if StartTurn's async flow hangs (which happens after undo breaks a hook/power).
             if (cs?.CurrentSide == CombatSide.Player)
             {
+                UndoAndRedoMod.SetLastStartTurn(cs.RoundNumber, cs.CurrentSide);
                 _ = DelayedPlayPhaseCheck(cs);
             }
         }
@@ -1160,11 +1174,20 @@ public static class PatchStartTurn
             // 2. 이미 플레이어 페이즈(IsPlayPhase)로 진입했거나
             // 3. 현재 턴이 플레이어가 아니거나
             // 4. 액션 동기화 상태가 이미 PlayPhase라면 중단
+            // 5. 이미 정상적으로 StartTurn이 처리되었다면 중단
             bool isPlayPhase = (bool)(UndoAndRedoMod.IsPlayPhaseProp?.GetValue(cm) ?? false);
             if (cm == null || !cm.IsInProgress || isPlayPhase || cs.CurrentSide != CombatSide.Player) return;
             if (syncr == null || syncr.CombatState == MegaCrit.Sts2.Core.Entities.Multiplayer.ActionSynchronizerCombatState.PlayPhase) return;
+            
+            if (UndoAndRedoMod.IsStartTurnHandled(cs.RoundNumber, cs.CurrentSide)) 
+            {
+                Log.Write($">>> DelayedPlayPhaseCheck: Round {cs.RoundNumber} already handled by normal flow.");
+                return;
+            }
 
             // StartTurn's async flow hung — the hooks and PlayPhase init never ran.
+            Log.Write(">>> DelayedPlayPhaseCheck: StartTurn hung, running skipped steps");
+            UndoAndRedoMod.SetLastStartTurn(cs.RoundNumber, cs.CurrentSide);
 
             // 1. Hook.AfterSideTurnStart (power/relic turn start effects)
             try
