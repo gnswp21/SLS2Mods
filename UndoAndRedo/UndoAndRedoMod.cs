@@ -1202,9 +1202,9 @@ public static class PatchStartTurn
                 {
                     if (!player.Creature.IsDead)
                     {
-                        Log.Write(">>> DelayedPlayPhaseCheck: calling Hook.BeforePlayPhaseStart");
-                        await MegaCrit.Sts2.Core.Hooks.Hook.BeforePlayPhaseStart(cs, player);
-                        Log.Write(">>> DelayedPlayPhaseCheck: Hook.BeforePlayPhaseStart done");
+                        // Log.Write(">>> DelayedPlayPhaseCheck: calling Hook.BeforePlayPhaseStart");
+                        // await MegaCrit.Sts2.Core.Hooks.Hook.BeforePlayPhaseStart(cs, player);
+                        // Log.Write(">>> DelayedPlayPhaseCheck: Hook.BeforePlayPhaseStart done");
                     }
                 }
             }
